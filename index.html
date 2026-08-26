@@ -66,6 +66,25 @@ function Icon({ name, size = 18, color = "currentColor" }) {
   }
 }
 
+/* ============ error boundary (keeps the whole app from going blank on a crash) ============ */
+class ErrorBoundary extends React.Component {
+  constructor(props){ super(props); this.state = { hasError: false, message: "" }; }
+  static getDerivedStateFromError(error){ return { hasError: true, message: String((error && error.message) || error) }; }
+  componentDidCatch(error, info){ if (window.console) console.error(error, info); }
+  render(){
+    if (this.state.hasError) {
+      return (
+        <div style={{background:"#0E1024",color:"#F1EFFB",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center",gap:12}}>
+          <div style={{fontSize:16,fontWeight:600}}>Ops, algo travou aqui.</div>
+          <div style={{fontSize:12,color:"#9AA0C7",maxWidth:280}}>Seus dados continuam salvos no aparelho. Toque no botão abaixo para recarregar o app.</div>
+          <button onClick={()=>window.location.reload()} style={{background:"#F2C572",color:"#0E1024",border:"none",borderRadius:10,padding:"10px 18px",fontSize:14,fontWeight:600,cursor:"pointer"}}>Recarregar</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 /* ============ crypto helpers ============ */
 const CRYPTO_OK = !!(window.crypto && window.crypto.subtle);
 function bufToB64(buf){ return btoa(String.fromCharCode(...new Uint8Array(buf))); }
@@ -677,12 +696,17 @@ function MindMap({ activities, categories, connections, setConnections }){
   }, [activities, allEdges]);
 
   function svgPoint(evt){
-    const svg = svgRef.current; const pt = svg.createSVGPoint();
+    const svg = svgRef.current;
+    if(!svg) return null;
+    const ctm = svg.getScreenCTM();
+    if(!ctm) return null;
+    const pt = svg.createSVGPoint();
     pt.x = evt.clientX; pt.y = evt.clientY;
-    return pt.matrixTransform(svg.getScreenCTM().inverse());
+    return pt.matrixTransform(ctm.inverse());
   }
   function toWorld(evt){
     const p = svgPoint(evt);
+    if(!p) return null;
     return { x: (p.x - view.tx) / view.scale, y: (p.y - view.ty) / view.scale };
   }
   function addManual(){
@@ -693,24 +717,35 @@ function MindMap({ activities, categories, connections, setConnections }){
   function zoomBy(factor){
     setView(v=>{
       const newScale = Math.max(0.4, Math.min(3, v.scale*factor));
-      return { ...v, scale:newScale };
+      return { ...v, scale: isFinite(newScale) ? newScale : v.scale };
     });
   }
   function resetView(){ setView({ scale:1, tx:0, ty:0 }); }
 
+  function safeCapture(e){
+    try { if (svgRef.current && e.pointerId!==undefined) svgRef.current.setPointerCapture(e.pointerId); } catch(err) { /* ignore */ }
+  }
   function onBgPointerDown(e){
+    safeCapture(e);
     panRef.current = { startX: e.clientX, startY: e.clientY, tx0: view.tx, ty0: view.ty };
   }
+  function onNodePointerDown(e, id){
+    e.stopPropagation();
+    safeCapture(e);
+    setDrag(id);
+  }
   function onSvgPointerMove(e){
-    if(drag){
-      const p = toWorld(e);
-      setPositions(prev=>({...prev,[drag]:{x:p.x,y:p.y}}));
-      return;
-    }
-    if(panRef.current){
-      const dx = e.clientX - panRef.current.startX, dy = e.clientY - panRef.current.startY;
-      setView(v=>({ ...v, tx: panRef.current.tx0+dx, ty: panRef.current.ty0+dy }));
-    }
+    try {
+      if(drag){
+        const p = toWorld(e);
+        if(p) setPositions(prev=>({...prev,[drag]:{x:p.x,y:p.y}}));
+        return;
+      }
+      if(panRef.current){
+        const dx = e.clientX - panRef.current.startX, dy = e.clientY - panRef.current.startY;
+        setView(v=>({ ...v, tx: panRef.current.tx0+dx, ty: panRef.current.ty0+dy }));
+      }
+    } catch(err) { /* never let a pointer glitch take down the app */ }
   }
   function onSvgPointerUp(){ setDrag(null); panRef.current = null; }
   function onWheel(e){
@@ -745,7 +780,7 @@ function MindMap({ activities, categories, connections, setConnections }){
               const p = positions[a.id]; if(!p) return null;
               const color = catColor(categories, a.values.categoria); const isSel = selected===a.id;
               return (
-                <g key={a.id} transform={`translate(${p.x},${p.y})`} onPointerDown={e=>{e.stopPropagation(); setDrag(a.id);}} onClick={()=>setSelected(isSel?null:a.id)} style={{cursor:"pointer"}}>
+                <g key={a.id} transform={`translate(${p.x},${p.y})`} onPointerDown={e=>onNodePointerDown(e, a.id)} onClick={()=>setSelected(isSel?null:a.id)} style={{cursor:"pointer"}}>
                   <circle r={isSel?13:10} fill={color} stroke={isSel?GOLD:"none"} strokeWidth={2} />
                   <text y={22} fontSize="8" fill={TEXT} textAnchor="middle" style={{pointerEvents:"none"}}>
                     {a.values.atividade.length>16 ? a.values.atividade.slice(0,15)+"…" : a.values.atividade}
@@ -952,7 +987,7 @@ function Section({ title, icon, open, onToggle, children }){
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<Root />);
+ReactDOM.createRoot(document.getElementById("root")).render(<ErrorBoundary><Root /></ErrorBoundary>);
 </script>
 <script>
   (function () {
