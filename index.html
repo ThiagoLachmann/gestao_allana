@@ -553,7 +553,7 @@ function CalendarTab({ activities, categories, fields, getStatus, setStatus }){
           {cells.map((d,i)=>{
             if(!d) return <div key={i} />;
             const iso = isoDate(d);
-            const count = activities.filter(a=>occursOn(a.values, d)).length;
+            const pending = activities.filter(a=>occursOn(a.values, d) && getStatus(a.id, iso)!=="finalizado").length;
             const isSelected = iso===selected;
             const isToday = iso===todayIso;
             return (
@@ -564,7 +564,7 @@ function CalendarTab({ activities, categories, fields, getStatus, setStatus }){
                   fontSize:12, cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:2, padding:0
                 }}>
                 {d.getDate()}
-                {count>0 && <span style={{width:4,height:4,borderRadius:99,background:isSelected?INK:GOLD}} />}
+                {pending>0 && <span style={{width:4,height:4,borderRadius:99,background:isSelected?INK:GOLD}} />}
               </button>
             );
           })}
