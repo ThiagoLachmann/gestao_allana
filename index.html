@@ -77,6 +77,7 @@ class ErrorBoundary extends React.Component {
         <div style={{background:"#0E1024",color:"#F1EFFB",minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,textAlign:"center",gap:12}}>
           <div style={{fontSize:16,fontWeight:600}}>Ops, algo travou aqui.</div>
           <div style={{fontSize:12,color:"#9AA0C7",maxWidth:280}}>Seus dados continuam salvos no aparelho. Toque no botão abaixo para recarregar o app.</div>
+          {this.state.message && <div style={{fontSize:11,color:"#F27FA6",maxWidth:300,background:"#171A36",border:"1px solid #33386B",borderRadius:10,padding:10,wordBreak:"break-word"}}>{this.state.message}</div>}
           <button onClick={()=>window.location.reload()} style={{background:"#F2C572",color:"#0E1024",border:"none",borderRadius:10,padding:"10px 18px",fontSize:14,fontWeight:600,cursor:"pointer"}}>Recarregar</button>
         </div>
       );
@@ -426,7 +427,6 @@ function App({ state, persist, onLogout }){
           {tab==="hoje" && <Hoje todayActivities={todayActivities} fields={fields} categories={categories} todayIso={todayIso} getStatus={getStatus} setStatus={setStatus} />}
           {tab==="calendario" && <CalendarTab activities={activeActivities} categories={categories} fields={fields} getStatus={getStatus} setStatus={setStatus} />}
           {tab==="kanban" && <Kanban activities={activeActivities} categories={categories} getStatus={getStatus} setStatus={setStatus} />}
-          {tab==="mapa" && <MindMap activities={activeActivities} categories={categories} connections={connections} setConnections={setConnections} />}
           {tab==="atividades" && <Atividades activities={activities} setActivities={setActivities} fields={fields} categories={categories} getStatus={getStatus} setStatus={setStatus} todayIso={todayIso} onAdd={syncAdd} onEdit={syncEdit} onDelete={syncDelete} />}
           {tab==="ajustes" && <Ajustes fields={fields} setFields={setFields} categories={categories} setCategories={setCategories} settings={settings} setSettings={setSettings} syncState={syncState} testConnection={testConnection} importFromSheet={importFromSheet} />}
         </div>
@@ -434,7 +434,6 @@ function App({ state, persist, onLogout }){
           <TabBtn icon="home" label="Hoje" active={tab==="hoje"} onClick={()=>setTab("hoje")} />
           <TabBtn icon="calendar" label="Calendário" active={tab==="calendario"} onClick={()=>setTab("calendario")} />
           <TabBtn icon="grid" label="Kanban" active={tab==="kanban"} onClick={()=>setTab("kanban")} />
-          <TabBtn icon="share" label="Mapa" active={tab==="mapa"} onClick={()=>setTab("mapa")} />
           <TabBtn icon="list" label="Atividades" active={tab==="atividades"} onClick={()=>setTab("atividades")} />
           <TabBtn icon="gear" label="Ajustes" active={tab==="ajustes"} onClick={()=>setTab("ajustes")} />
         </nav>
@@ -444,7 +443,7 @@ function App({ state, persist, onLogout }){
 }
 
 function Header({ tab, today, todayWdLabel, settings, syncState, onLogout }){
-  const titles = { hoje:"Hoje", calendario:"Calendário", kanban:"Kanban", mapa:"Mapa Mental", atividades:"Atividades", ajustes:"Ajustes" };
+  const titles = { hoje:"Hoje", calendario:"Calendário", kanban:"Kanban", atividades:"Atividades", ajustes:"Ajustes" };
   const dateStr = today.toLocaleDateString("pt-BR",{day:"2-digit",month:"long"});
   return (
     <div style={{padding:"20px 16px 16px",display:"flex",alignItems:"flex-start",justifyContent:"space-between"}}>
@@ -657,172 +656,6 @@ function Kanban({ activities, categories, getStatus, setStatus }){
     </div>
   );
 }
-
-/* ---------- MAPA MENTAL ---------- */
-function MindMap({ activities, categories, connections, setConnections }){
-  const svgRef = useRef(null);
-  const [positions, setPositions] = useState({});
-  const [selected, setSelected] = useState(null);
-  const [drag, setDrag] = useState(null);
-  const [view, setView] = useState({ scale: 1, tx: 0, ty: 0 });
-  const panRef = useRef(null);
-  const [formOpen, setFormOpen] = useState(false);
-  const [formA, setFormA] = useState(""); const [formB, setFormB] = useState(""); const [formLabel, setFormLabel] = useState("");
-
-  const VB_W = 440, VB_H = 420;
-
-  const autoEdges = useMemo(()=>{
-    const byCat = {};
-    activities.forEach(a=>{ (byCat[a.values.categoria]=byCat[a.values.categoria]||[]).push(a.id); });
-    const edges = [];
-    Object.values(byCat).forEach(ids=>{ for(let i=0;i<ids.length-1;i++) edges.push({from:ids[i],to:ids[i+1],type:"auto"}); });
-    return edges;
-  }, [activities]);
-  const allEdges = useMemo(()=>[...autoEdges, ...connections], [autoEdges, connections]);
-
-  useEffect(()=>{
-    const nodes = activities.map(a=>({id:a.id}));
-    const links = allEdges.map(e=>({source:e.from,target:e.to}));
-    const sim = d3.forceSimulation(nodes)
-      .force("charge", d3.forceManyBody().strength(-260))
-      .force("link", d3.forceLink(links).id(d=>d.id).distance(95).strength(0.5))
-      .force("center", d3.forceCenter(VB_W/2, VB_H/2))
-      .force("collide", d3.forceCollide(38))
-      .stop();
-    for(let i=0;i<400;i++) sim.tick();
-    const pos = {}; nodes.forEach(n=>{ pos[n.id]={x:n.x,y:n.y}; });
-    setPositions(pos);
-    setView({ scale: 1, tx: 0, ty: 0 });
-  }, [activities, allEdges]);
-
-  function svgPoint(evt){
-    const svg = svgRef.current;
-    if(!svg) return null;
-    const ctm = svg.getScreenCTM();
-    if(!ctm) return null;
-    const pt = svg.createSVGPoint();
-    pt.x = evt.clientX; pt.y = evt.clientY;
-    return pt.matrixTransform(ctm.inverse());
-  }
-  function toWorld(evt){
-    const p = svgPoint(evt);
-    if(!p) return null;
-    return { x: (p.x - view.tx) / view.scale, y: (p.y - view.ty) / view.scale };
-  }
-  function addManual(){
-    if(!formA || !formB || formA===formB) return;
-    setConnections(prev=>[...prev, {id:`m${Date.now()}`, from:formA, to:formB, label:formLabel, type:"manual"}]);
-    setFormA(""); setFormB(""); setFormLabel("");
-  }
-  function zoomBy(factor){
-    setView(v=>{
-      const newScale = Math.max(0.4, Math.min(3, v.scale*factor));
-      return { ...v, scale: isFinite(newScale) ? newScale : v.scale };
-    });
-  }
-  function resetView(){ setView({ scale:1, tx:0, ty:0 }); }
-
-  function safeCapture(e){
-    try { if (svgRef.current && e.pointerId!==undefined) svgRef.current.setPointerCapture(e.pointerId); } catch(err) { /* ignore */ }
-  }
-  function onBgPointerDown(e){
-    safeCapture(e);
-    panRef.current = { startX: e.clientX, startY: e.clientY, tx0: view.tx, ty0: view.ty };
-  }
-  function onNodePointerDown(e, id){
-    e.stopPropagation();
-    safeCapture(e);
-    setDrag(id);
-  }
-  function onSvgPointerMove(e){
-    try {
-      if(drag){
-        const p = toWorld(e);
-        if(p) setPositions(prev=>({...prev,[drag]:{x:p.x,y:p.y}}));
-        return;
-      }
-      if(panRef.current){
-        const dx = e.clientX - panRef.current.startX, dy = e.clientY - panRef.current.startY;
-        setView(v=>({ ...v, tx: panRef.current.tx0+dx, ty: panRef.current.ty0+dy }));
-      }
-    } catch(err) { /* never let a pointer glitch take down the app */ }
-  }
-  function onSvgPointerUp(){ setDrag(null); panRef.current = null; }
-  function onWheel(e){
-    e.preventDefault();
-    zoomBy(e.deltaY < 0 ? 1.1 : 0.9);
-  }
-
-  return (
-    <div style={{display:"flex",flexDirection:"column",gap:12}}>
-      <div style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,overflow:"hidden",position:"relative"}}>
-        <svg ref={svgRef} viewBox={`0 0 ${VB_W} ${VB_H}`} style={{width:"100%",height:400,touchAction:"none",display:"block"}}
-          onWheel={onWheel}
-          onPointerDown={e=>{ if(e.target===svgRef.current || e.target.tagName==="rect") onBgPointerDown(e); }}
-          onPointerMove={onSvgPointerMove}
-          onPointerUp={onSvgPointerUp} onPointerLeave={onSvgPointerUp}>
-          <rect x="0" y="0" width={VB_W} height={VB_H} fill="transparent" />
-          <g transform={`translate(${view.tx},${view.ty}) scale(${view.scale})`}>
-            {allEdges.map((e,i)=>{
-              const a = positions[e.from], b = positions[e.to]; if(!a||!b) return null;
-              const isManual = e.type==="manual";
-              const fromAct = activities.find(x=>x.id===e.from);
-              return (
-                <g key={i}>
-                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                    stroke={isManual?GOLD:catColor(categories, fromAct ? fromAct.values.categoria : null)}
-                    strokeWidth={isManual?1.6:1} strokeDasharray={isManual?"4 3":undefined} opacity={isManual?0.9:0.35} />
-                  {isManual && e.label && <text x={(a.x+b.x)/2} y={(a.y+b.y)/2-4} fontSize="8" fill={GOLD} textAnchor="middle">{e.label}</text>}
-                </g>
-              );
-            })}
-            {activities.map(a=>{
-              const p = positions[a.id]; if(!p) return null;
-              const color = catColor(categories, a.values.categoria); const isSel = selected===a.id;
-              return (
-                <g key={a.id} transform={`translate(${p.x},${p.y})`} onPointerDown={e=>onNodePointerDown(e, a.id)} onClick={()=>setSelected(isSel?null:a.id)} style={{cursor:"pointer"}}>
-                  <circle r={isSel?13:10} fill={color} stroke={isSel?GOLD:"none"} strokeWidth={2} />
-                  <text y={22} fontSize="8" fill={TEXT} textAnchor="middle" style={{pointerEvents:"none"}}>
-                    {a.values.atividade.length>16 ? a.values.atividade.slice(0,15)+"…" : a.values.atividade}
-                  </text>
-                </g>
-              );
-            })}
-          </g>
-        </svg>
-        <div style={{position:"absolute",right:8,bottom:8,display:"flex",flexDirection:"column",gap:6}}>
-          <button onClick={()=>zoomBy(1.25)} style={zoomBtnStyle}><Icon name="plus" size={14} color={TEXT}/></button>
-          <button onClick={()=>zoomBy(0.8)} style={zoomBtnStyle}><Icon name="minus" size={14} color={TEXT}/></button>
-          <button onClick={resetView} style={zoomBtnStyle}><Icon name="maximize" size={13} color={TEXT}/></button>
-        </div>
-      </div>
-      {selected && (()=>{ const a = activities.find(x=>x.id===selected); if(!a) return null;
-        return <div style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:12}}>
-          <div style={{fontWeight:500,fontSize:14}}>{a.values.atividade}</div>
-          <div style={{color:MUTED,fontSize:12,marginTop:2}}>{catName(categories,a.values.categoria)} · {a.values.frequencia} · {a.values.horario}</div>
-        </div>;
-      })()}
-      <div style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:12}}>
-        <button onClick={()=>setFormOpen(o=>!o)} style={{background:"transparent",border:"none",cursor:"pointer",width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-          <span style={{fontSize:12,color:MUTED,display:"flex",alignItems:"center",gap:6}}><Icon name="link" size={13}/> Criar conexão manual</span>
-          <Icon name={formOpen?"chevronup":"chevrondown"} size={14} color={MUTED} />
-        </button>
-        {formOpen && (
-          <div style={{marginTop:10}}>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
-              <select value={formA} onChange={e=>setFormA(e.target.value)} style={inputStyle}><option value="">Atividade A</option>{activities.map(a=><option key={a.id} value={a.id}>{a.values.atividade}</option>)}</select>
-              <select value={formB} onChange={e=>setFormB(e.target.value)} style={inputStyle}><option value="">Atividade B</option>{activities.map(a=><option key={a.id} value={a.id}>{a.values.atividade}</option>)}</select>
-            </div>
-            <input value={formLabel} onChange={e=>setFormLabel(e.target.value)} placeholder="Rótulo (ex: mesmo momento do dia)" style={{...inputStyle,marginBottom:8}} />
-            <button onClick={addManual} style={{...btnGold,width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}><Icon name="plus" size={13} color={INK}/> Conectar</button>
-          </div>
-        )}
-      </div>
-      <div style={{fontSize:11,color:MUTED,padding:"0 4px"}}>Arraste um ponto pra mover; arraste o fundo pra navegar; use os botões (ou o scroll) pra dar zoom.</div>
-    </div>
-  );
-}
-const zoomBtnStyle = { width:32, height:32, borderRadius:8, background:"rgba(23,26,54,0.9)", border:`1px solid ${HAIRLINE}`, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer" };
 
 /* ---------- ATIVIDADES ---------- */
 function Atividades({ activities, setActivities, fields, categories, getStatus, setStatus, todayIso, onAdd, onEdit, onDelete }){
