@@ -180,7 +180,7 @@ const RAW = [
 ["compromissos","Organizar atividades da semana","Semanal","Domingo","Tarde","40 min","Alta","Sim, 1 dia antes","","Conferir tabela, agenda e indicadores"],
 ];
 const DEFAULT_ACTIVITIES = RAW.map((r,i)=>({ id:`a${i+1}`, ativo:true, values:{ categoria:r[0], atividade:r[1], frequencia:r[2], diasSemana:r[3], horario:r[4], duracao:r[5], prioridade:r[6], lembrete:r[7], data:r[8], observacoes:r[9] }}));
-const DEFAULT_STATE = { categories: DEFAULT_CATEGORIES, fields: DEFAULT_FIELDS, activities: DEFAULT_ACTIVITIES, connections: [], statusMap: {}, settings: { appsScriptUrl: "" } };
+const DEFAULT_STATE = { categories: DEFAULT_CATEGORIES, fields: DEFAULT_FIELDS, activities: DEFAULT_ACTIVITIES, connections: [], statusMap: {}, wellbeing: {}, notes: {}, reschedules: {}, settings: { appsScriptUrl: "" } };
 
 const STATUS_LIST = [
   { id: "aguardando", label: "Aguardando Início" },
@@ -221,6 +221,29 @@ function occursOn(values, date){
     return date.getDate()===1;
   }
   return false;
+}
+// resolves the real list of activities happening on `date`, honoring any single-day
+// reschedules (an activity moved away from its natural date, or moved into this one)
+function getOccurrencesForDate(activities, date, reschedules){
+  const iso = isoDate(date);
+  const results = []; const seen = new Set();
+  activities.forEach(a=>{
+    const key = `${a.id}_${iso}`;
+    const movedAway = reschedules && reschedules[key];
+    if(occursOn(a.values, date) && !movedAway){ results.push(a); seen.add(a.id); }
+  });
+  if(reschedules){
+    Object.keys(reschedules).forEach(k=>{
+      if(reschedules[k]===iso){
+        const activityId = k.slice(0, k.lastIndexOf("_"));
+        if(!seen.has(activityId)){
+          const act = activities.find(a=>a.id===activityId);
+          if(act){ results.push(act); seen.add(activityId); }
+        }
+      }
+    });
+  }
+  return results;
 }
 function matchesWeekday(values, wdIndex){
   if(wdIndex===null || wdIndex===undefined) return true;
@@ -396,6 +419,9 @@ const btnDanger = { background:"transparent", color:"#F27FA6", border:"1px solid
 function App({ state, persist, onLogout }){
   const [tab, setTab] = useState("hoje");
   const { categories, fields, activities, connections, statusMap, settings } = state;
+  const wellbeing = state.wellbeing || {};
+  const notes = state.notes || {};
+  const reschedules = state.reschedules || {};
 
   function update(patch){ persist({ ...state, ...patch }); }
   function setCategories(fn){ update({ categories: fn(categories) }); }
@@ -404,6 +430,9 @@ function App({ state, persist, onLogout }){
   function setConnections(fn){ update({ connections: fn(connections) }); }
   function setStatusMap(fn){ update({ statusMap: fn(statusMap) }); }
   function setSettings(fn){ update({ settings: fn(settings) }); }
+  function setWellbeing(fn){ update({ wellbeing: fn(wellbeing) }); }
+  function setNotes(fn){ update({ notes: fn(notes) }); }
+  function setReschedules(fn){ update({ reschedules: fn(reschedules) }); }
 
   const [syncState, setSyncState] = useState("idle");
   async function testConnection(){
@@ -444,33 +473,53 @@ function App({ state, persist, onLogout }){
 
   const activeActivities = useMemo(()=>activities.filter(a=>a.ativo!==false), [activities]);
   const today = new Date(); const todayIso = isoDate(today); const todayWdLabel = WD[today.getDay()];
-  const todayActivities = useMemo(()=>activeActivities.filter(a=>occursOn(a.values, today)), [activeActivities]);
+  const todayActivities = useMemo(()=>getOccurrencesForDate(activeActivities, today, reschedules), [activeActivities, reschedules, todayIso]);
 
   function getStatus(activityId, date){ return statusMap[`${activityId}_${date}`] || "aguardando"; }
   function setStatus(activityId, date, status){ setStatusMap(prev=>({ ...prev, [`${activityId}_${date}`]: status })); syncStatus(activityId, date, status); }
+  function rescheduleOccurrence(activityId, oldDate, newDate){
+    if(!newDate || newDate===oldDate) return;
+    const oldKey = `${activityId}_${oldDate}`;
+    setStatusMap(prev => {
+      const next = { ...prev };
+      if(next[oldKey]){ next[`${activityId}_${newDate}`] = next[oldKey]; delete next[oldKey]; }
+      return next;
+    });
+    setReschedules(prev => ({ ...prev, [oldKey]: newDate }));
+  }
+
+  const [quickAddTick, setQuickAddTick] = useState(0);
 
   return (
     <div style={{background:INK,color:TEXT,minHeight:"100vh"}} className="fade-in">
-      <div style={{maxWidth:420,margin:"0 auto",display:"flex",flexDirection:"column",minHeight:"100vh"}}>
+      <div style={{maxWidth:420,margin:"0 auto",display:"flex",flexDirection:"column",minHeight:"100vh",position:"relative"}}>
         <div style={{borderColor:HAIRLINE,borderBottom:"1px solid"}}>
           <Header tab={tab} today={today} todayWdLabel={todayWdLabel} settings={settings} syncState={syncState} onLogout={onLogout} />
         </div>
         <div style={{flex:1,overflowY:"auto",padding:"16px"}}>
-          {tab==="hoje" && <Hoje todayActivities={todayActivities} fields={fields} categories={categories} todayIso={todayIso} getStatus={getStatus} setStatus={setStatus} />}
-          {tab==="calendario" && <CalendarTab activities={activeActivities} categories={categories} fields={fields} getStatus={getStatus} setStatus={setStatus} />}
-          {tab==="graficos" && <GraficosTab activities={activeActivities} categories={categories} getStatus={getStatus} />}
-          {tab==="kanban" && <Kanban activities={activeActivities} categories={categories} getStatus={getStatus} setStatus={setStatus} />}
-          {tab==="atividades" && <Atividades activities={activities} setActivities={setActivities} fields={fields} categories={categories} getStatus={getStatus} setStatus={setStatus} todayIso={todayIso} onAdd={syncAdd} onEdit={syncEdit} onDelete={syncDelete} />}
+          {tab==="hoje" && <Hoje todayActivities={todayActivities} allActivities={activeActivities} fields={fields} categories={categories} todayIso={todayIso} getStatus={getStatus} setStatus={setStatus} wellbeing={wellbeing} setWellbeing={setWellbeing} notes={notes} setNotes={setNotes} reschedules={reschedules} />}
+          {tab==="calendario" && <CalendarTab activities={activeActivities} categories={categories} fields={fields} getStatus={getStatus} setStatus={setStatus} reschedules={reschedules} />}
+          {tab==="graficos" && <GraficosTab activities={activeActivities} categories={categories} getStatus={getStatus} reschedules={reschedules} />}
+          {tab==="kanban" && <Kanban activities={activeActivities} categories={categories} getStatus={getStatus} setStatus={setStatus} reschedules={reschedules} onReschedule={rescheduleOccurrence} />}
+          {tab==="atividades" && <Atividades activities={activities} setActivities={setActivities} fields={fields} categories={categories} getStatus={getStatus} setStatus={setStatus} todayIso={todayIso} onAdd={syncAdd} onEdit={syncEdit} onDelete={syncDelete} quickAddTick={quickAddTick} />}
           {tab==="ajustes" && <Ajustes fields={fields} setFields={setFields} categories={categories} setCategories={setCategories} settings={settings} setSettings={setSettings} syncState={syncState} testConnection={testConnection} importFromSheet={importFromSheet} />}
         </div>
+        <button
+          onClick={()=>{ setTab("atividades"); setQuickAddTick(t=>t+1); }}
+          aria-label="Nova atividade"
+          style={{ position:"absolute", left:"50%", transform:"translateX(-50%)", bottom:44, width:52, height:52, borderRadius:99, background:GOLD, border:`4px solid ${INK}`, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", boxShadow:"0 2px 10px rgba(0,0,0,0.4)" }}>
+          <Icon name="plus" size={22} color={INK} />
+        </button>
         <nav style={{borderColor:HAIRLINE,borderTop:"1px solid",background:PANEL,display:"flex",justifyContent:"space-around",padding:"6px 0"}}>
           <TabBtn icon="home" label="Hoje" active={tab==="hoje"} onClick={()=>setTab("hoje")} />
           <TabBtn icon="calendar" label="Calendário" active={tab==="calendario"} onClick={()=>setTab("calendario")} />
           <TabBtn icon="chart" label="Gráficos" active={tab==="graficos"} onClick={()=>setTab("graficos")} />
+          <span style={{width:40}} />
           <TabBtn icon="grid" label="Kanban" active={tab==="kanban"} onClick={()=>setTab("kanban")} />
           <TabBtn icon="list" label="Atividades" active={tab==="atividades"} onClick={()=>setTab("atividades")} />
           <TabBtn icon="gear" label="Ajustes" active={tab==="ajustes"} onClick={()=>setTab("ajustes")} />
         </nav>
+
       </div>
     </div>
   );
@@ -521,42 +570,180 @@ function WeekdayFilter({ value, onChange }){
 }
 
 /* ---------- HOJE ---------- */
-function Hoje({ todayActivities, fields, categories, todayIso, getStatus, setStatus }){
+const MOOD_EMOJI = ["😞","😕","😐","🙂","😄"];
+const ENERGY_EMOJI = ["🪫","😴","😌","🙂","⚡"];
+const SLEEP_EMOJI = ["😩","🥱","😐","🙂","🌙"];
+const OVERDUE_LOOKBACK_DAYS = 14;
+
+function getOverdue(activities, getStatus, refDate, reschedules){
+  const items = [];
+  for(let i=1;i<=OVERDUE_LOOKBACK_DAYS;i++){
+    const d = new Date(refDate); d.setDate(d.getDate()-i);
+    const iso = isoDate(d);
+    getOccurrencesForDate(activities, d, reschedules).forEach(a=>{
+      const st = getStatus(a.id, iso);
+      if(st!=="finalizado" && st!=="cancelado") items.push({ activity:a, date:iso, dateObj:d });
+    });
+  }
+  return items.sort((x,y)=> x.date.localeCompare(y.date));
+}
+
+function SectionLabel({ children }){
+  return <div style={{fontFamily:"Georgia,serif",fontSize:15,color:TEXT,marginBottom:8}}>{children}</div>;
+}
+
+function WellbeingRow({ label, options, value, onChange }){
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+      <span style={{fontSize:12,color:MUTED,width:56,flexShrink:0}}>{label}</span>
+      <div style={{display:"flex",gap:6,flex:1,justifyContent:"space-between"}}>
+        {options.map((emoji,i)=>(
+          <button key={i} onClick={()=>onChange(i)}
+            style={{
+              fontSize:18, width:32, height:32, borderRadius:9, cursor:"pointer",
+              background: value===i ? GOLD : "transparent",
+              border: value===i ? `1px solid ${GOLD}` : `1px solid ${HAIRLINE}`,
+              opacity: value===i || value===undefined ? 1 : 0.45
+            }}>{emoji}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Hoje({ todayActivities, allActivities, fields, categories, todayIso, getStatus, setStatus, wellbeing, setWellbeing, notes, setNotes, reschedules }){
   const done = todayActivities.filter(a=>getStatus(a.id, todayIso)==="finalizado").length;
   const total = todayActivities.length;
   const visibleFields = fields.filter(f=>f.show.today && f.id!=="categoria" && f.id!=="atividade");
-  if(total===0) return <EmptyState text="Nenhuma atividade prevista para hoje. Aproveite para respirar ou adiantar algo da semana." />;
+
+  const [overdueOpen, setOverdueOpen] = useState(false);
+  const overdue = useMemo(()=>getOverdue(allActivities, getStatus, new Date(), reschedules), [allActivities, getStatus, todayIso, reschedules]);
+  function dismissOverdue(){
+    overdue.forEach(item => setStatus(item.activity.id, item.date, "cancelado"));
+    setOverdueOpen(false);
+  }
+
+  const todayWellbeing = wellbeing[todayIso] || {};
+  function setMood(kind, i){ setWellbeing(prev => ({ ...prev, [todayIso]: { ...(prev[todayIso]||{}), [kind]: i } })); }
+
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [noteDraft, setNoteDraft] = useState(notes[todayIso] || "");
+  useEffect(()=>{ setNoteDraft(notes[todayIso] || ""); }, [todayIso]);
+  function commitNote(){ setNotes(prev => ({ ...prev, [todayIso]: noteDraft })); }
+
+  const weekDays = useMemo(()=>getWeekDays(new Date()), [todayIso]);
+  const weekStats = useMemo(()=>{
+    let completed = 0, daysComplete = 0;
+    weekDays.forEach(d=>{
+      const iso = isoDate(d);
+      const scheduled = getOccurrencesForDate(allActivities, d, reschedules);
+      const done_ = scheduled.filter(a=>getStatus(a.id, iso)==="finalizado");
+      completed += done_.length;
+      if(scheduled.length>0 && done_.length===scheduled.length) daysComplete++;
+    });
+    return { completed, daysComplete };
+  }, [allActivities, weekDays, todayIso]);
+
   return (
-    <div style={{display:"flex",flexDirection:"column",gap:10}}>
-      <div style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:12,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <span style={{fontSize:13,color:MUTED}}>Progresso de hoje</span>
-        <span style={{fontSize:13,fontWeight:600,color:GOLD}}>{done}/{total}</span>
-      </div>
-      {todayActivities.map(a=>{
-        const isDone = getStatus(a.id, todayIso)==="finalizado";
-        const color = catColor(categories, a.values.categoria);
-        return (
-          <div key={a.id} style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:12,opacity:isDone?0.55:1,display:"flex",gap:12,alignItems:"flex-start"}}>
-            <QuickCheck done={isDone} onToggle={()=>setStatus(a.id, todayIso, isDone?"aguardando":"finalizado")} />
-            <div style={{flex:1,minWidth:0}}>
-              <div style={{display:"flex",alignItems:"center",gap:8}}>
-                <span style={{background:color,width:8,height:8,borderRadius:99,flexShrink:0}} />
-                <span style={{fontSize:14,fontWeight:500,textDecoration:isDone?"line-through":"none"}}>{a.values.atividade}</span>
-              </div>
-              <div style={{display:"flex",flexWrap:"wrap",gap:"2px 12px",marginTop:4}}>
-                {visibleFields.map(f=><FieldValue key={f.id} field={f} value={a.values[f.id]} />)}
-              </div>
-            </div>
+    <div style={{display:"flex",flexDirection:"column",gap:18}}>
+      {overdue.length>0 && (
+        <div style={{background:"rgba(242,127,166,0.1)",border:"1px solid rgba(242,127,166,0.4)",borderRadius:16,padding:12}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+            <span style={{fontSize:13,color:"#F27FA6",fontWeight:600}}>{overdue.length} atrasada{overdue.length>1?"s":""}</span>
+            <button onClick={dismissOverdue} style={{background:"transparent",border:"none",color:"#F27FA6",fontSize:12,cursor:"pointer"}}>dispensar tudo</button>
           </div>
-        );
-      })}
+          <button onClick={()=>setOverdueOpen(o=>!o)} style={{background:"transparent",border:"none",color:MUTED,fontSize:11,cursor:"pointer",marginTop:4,padding:0}}>
+            {overdueOpen ? "ocultar lista" : "ver quais são"}
+          </button>
+          {overdueOpen && (
+            <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:6}}>
+              {overdue.slice(0,20).map((item,i)=>(
+                <div key={i} style={{fontSize:12,color:TEXT,display:"flex",justifyContent:"space-between"}}>
+                  <span>{item.activity.values.atividade}</span>
+                  <span style={{color:MUTED}}>{item.dateObj.toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit"})}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div>
+        <SectionLabel>Bem-estar de hoje</SectionLabel>
+        <div style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:14}}>
+          <WellbeingRow label="Humor" options={MOOD_EMOJI} value={todayWellbeing.humor} onChange={i=>setMood("humor",i)} />
+          <WellbeingRow label="Energia" options={ENERGY_EMOJI} value={todayWellbeing.energia} onChange={i=>setMood("energia",i)} />
+          <WellbeingRow label="Sono" options={SLEEP_EMOJI} value={todayWellbeing.sono} onChange={i=>setMood("sono",i)} />
+        </div>
+      </div>
+
+      <div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:8}}>
+          <SectionLabel>Hoje</SectionLabel>
+          <span style={{fontSize:12,color:GOLD}}>{done}/{total}</span>
+        </div>
+        {total===0 ? (
+          <EmptyState text="Nenhuma atividade prevista para hoje. Aproveite para respirar ou adiantar algo da semana." />
+        ) : (
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {todayActivities.map(a=>{
+              const isDone = getStatus(a.id, todayIso)==="finalizado";
+              const color = catColor(categories, a.values.categoria);
+              return (
+                <div key={a.id} style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:12,opacity:isDone?0.55:1,display:"flex",gap:12,alignItems:"flex-start"}}>
+                  <QuickCheck done={isDone} onToggle={()=>setStatus(a.id, todayIso, isDone?"aguardando":"finalizado")} />
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{background:color,width:8,height:8,borderRadius:99,flexShrink:0}} />
+                      <span style={{fontSize:14,fontWeight:500,textDecoration:isDone?"line-through":"none"}}>{a.values.atividade}</span>
+                    </div>
+                    <div style={{display:"flex",flexWrap:"wrap",gap:"2px 12px",marginTop:4}}>
+                      {visibleFields.map(f=><FieldValue key={f.id} field={f} value={a.values[f.id]} />)}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:12}}>
+        <button onClick={()=>{ setNoteOpen(o=>!o); }} style={{background:"transparent",border:"none",cursor:"pointer",width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <span style={{fontSize:13,color:MUTED}}>Nota do dia</span>
+          <Icon name={noteOpen?"chevronup":"chevrondown"} size={14} color={MUTED} />
+        </button>
+        {noteOpen && (
+          <textarea
+            value={noteDraft}
+            onChange={e=>setNoteDraft(e.target.value)}
+            onBlur={commitNote}
+            placeholder="Qualquer coisa que queira lembrar de hoje..."
+            style={{...inputStyle, minHeight:70, marginTop:10}}
+          />
+        )}
+      </div>
+
+      <div>
+        <SectionLabel>Resumo da semana</SectionLabel>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          <div style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:14}}>
+            <div style={{fontSize:22,fontWeight:600,color:GOLD}}>{weekStats.completed}</div>
+            <div style={{fontSize:11,color:MUTED,marginTop:2}}>tarefas concluídas</div>
+          </div>
+          <div style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,padding:14}}>
+            <div style={{fontSize:22,fontWeight:600,color:GOLD}}>{weekStats.daysComplete}/7</div>
+            <div style={{fontSize:11,color:MUTED,marginTop:2}}>dias em dia</div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
 function EmptyState({ text }){ return <div style={{color:MUTED,fontSize:13,textAlign:"center",padding:"60px 20px"}}>{text}</div>; }
 
 /* ---------- CALENDÁRIO ---------- */
-function CalendarTab({ activities, categories, fields, getStatus, setStatus }){
+function CalendarTab({ activities, categories, fields, getStatus, setStatus, reschedules }){
   const [monthDate, setMonthDate] = useState(new Date());
   const [selected, setSelected] = useState(isoDate(new Date()));
 
@@ -570,7 +757,7 @@ function CalendarTab({ activities, categories, fields, getStatus, setStatus }){
 
   const todayIso = isoDate(new Date());
   const selectedDateObj = new Date(selected+"T00:00:00");
-  const dayActivities = activities.filter(a=>occursOn(a.values, selectedDateObj));
+  const dayActivities = getOccurrencesForDate(activities, selectedDateObj, reschedules);
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:12}}>
@@ -587,7 +774,7 @@ function CalendarTab({ activities, categories, fields, getStatus, setStatus }){
           {cells.map((d,i)=>{
             if(!d) return <div key={i} />;
             const iso = isoDate(d);
-            const pending = activities.filter(a=>occursOn(a.values, d) && getStatus(a.id, iso)!=="finalizado").length;
+            const pending = getOccurrencesForDate(activities, d, reschedules).filter(a=>getStatus(a.id, iso)!=="finalizado").length;
             const isSelected = iso===selected;
             const isToday = iso===todayIso;
             return (
@@ -640,14 +827,14 @@ function getWeekDays(ref){
   for(let i=0;i<7;i++){ const dd = new Date(monday); dd.setDate(monday.getDate()+i); days.push(dd); }
   return days;
 }
-function GraficosTab({ activities, categories, getStatus }){
+function GraficosTab({ activities, categories, getStatus, reschedules }){
   const [weekOffset, setWeekOffset] = useState(0);
   const ref = new Date(); ref.setDate(ref.getDate()+weekOffset*7);
   const days = useMemo(()=>getWeekDays(ref), [weekOffset]);
 
   const perDay = days.map(d=>{
     const iso = isoDate(d);
-    const scheduled = activities.filter(a=>occursOn(a.values, d));
+    const scheduled = getOccurrencesForDate(activities, d, reschedules);
     const completed = scheduled.filter(a=>getStatus(a.id, iso)==="finalizado");
     return { d, iso, scheduled, completed };
   });
@@ -822,37 +1009,76 @@ function GraficosTab({ activities, categories, getStatus }){
 }
 
 /* ---------- KANBAN ---------- */
-function Kanban({ activities, categories, getStatus, setStatus }){
-  const [dragId, setDragId] = useState(null);
-  const [rangeDays, setRangeDays] = useState(14);
+function Kanban({ activities, categories, getStatus, setStatus, reschedules, onReschedule }){
+  const [weekOffset, setWeekOffset] = useState(0);
   const [weekdayFilter, setWeekdayFilter] = useState(null);
+  const [dragState, setDragState] = useState(null); // {activityId, date, startX, startY, moved}
+  const [hoverStatus, setHoverStatus] = useState(null);
+  const [pickerFor, setPickerFor] = useState(null);
+  const [rescheduleDraft, setRescheduleDraft] = useState("");
+
+  const refDate = useMemo(()=>{ const d = new Date(); d.setDate(d.getDate()+weekOffset*7); return d; }, [weekOffset]);
+  const week = useMemo(()=>getWeekDays(refDate), [refDate]);
+
   const cards = useMemo(()=>{
-    const out = []; const start = new Date();
-    for(let i=0;i<rangeDays;i++){
-      const d = new Date(start); d.setDate(start.getDate()+i);
-      if(weekdayFilter!==null && d.getDay()!==weekdayFilter) continue;
-      activities.forEach(a=>{ if(occursOn(a.values, d)) out.push({ activity:a, date: isoDate(d) }); });
-    }
+    const out = [];
+    week.forEach(d=>{
+      if(weekdayFilter!==null && d.getDay()!==weekdayFilter) return;
+      getOccurrencesForDate(activities, d, reschedules).forEach(a=> out.push({ activity:a, date: isoDate(d) }));
+    });
     return out;
-  }, [activities, rangeDays, weekdayFilter]);
+  }, [activities, week, weekdayFilter, reschedules]);
+
+  function fmt(d){ return d.toLocaleDateString("pt-BR",{day:"2-digit",month:"2-digit"}); }
+
+  function onCardPointerDown(e){
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch(err){}
+    setDragState({ activityId: e.currentTarget.dataset.aid, date: e.currentTarget.dataset.date, startX: e.clientX, startY: e.clientY, moved:false });
+  }
+  function onCardPointerMove(e){
+    if(!dragState) return;
+    try {
+      const dx = e.clientX-dragState.startX, dy = e.clientY-dragState.startY;
+      const moved = dragState.moved || Math.abs(dx)>8 || Math.abs(dy)>8;
+      if(moved){
+        e.preventDefault();
+        const el = document.elementFromPoint(e.clientX, e.clientY);
+        let node = el, status = null;
+        while(node){ if(node.dataset && node.dataset.status){ status = node.dataset.status; break; } node = node.parentElement; }
+        setHoverStatus(status);
+        if(!dragState.moved) setDragState(s=>({ ...s, moved:true }));
+      }
+    } catch(err){ /* keep app alive */ }
+  }
+  function onCardPointerUp(e, card){
+    try {
+      if(dragState && dragState.moved && hoverStatus){
+        setStatus(dragState.activityId, dragState.date, hoverStatus);
+      } else if(dragState && !dragState.moved){
+        setPickerFor(card); setRescheduleDraft("");
+      }
+    } catch(err){ /* keep app alive */ }
+    setDragState(null); setHoverStatus(null);
+  }
 
   return (
     <div>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,gap:8}}>
-        <WeekdayFilter value={weekdayFilter} onChange={setWeekdayFilter} />
-        <button onClick={()=>setRangeDays(r=>r+14)} style={{...btnGold, padding:"6px 10px", fontSize:12, display:"flex", alignItems:"center", gap:6, whiteSpace:"nowrap"}}>
-          <Icon name="calendar" size={13} color={INK}/> +14 dias
-        </button>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
+        <button onClick={()=>setWeekOffset(o=>o-1)} style={{background:"transparent",border:"none",cursor:"pointer"}}><Icon name="chevronleft" size={18} color={MUTED}/></button>
+        <span style={{fontSize:13,color:MUTED}}>{fmt(week[0])} – {fmt(week[6])}{weekOffset===0?" (esta semana)":""}</span>
+        <button onClick={()=>setWeekOffset(o=>o+1)} style={{background:"transparent",border:"none",cursor:"pointer"}}><Icon name="chevronright" size={18} color={MUTED}/></button>
       </div>
-      <div style={{fontSize:11,color:MUTED,marginBottom:8}}>Mostrando {rangeDays} dias à frente{weekdayFilter!==null?` · só ${WD_FULL[weekdayFilter]}`:""}</div>
+      <div style={{marginBottom:8}}>
+        <WeekdayFilter value={weekdayFilter} onChange={setWeekdayFilter} />
+      </div>
+      <div style={{fontSize:11,color:MUTED,marginBottom:8}}>Arraste um card para outra coluna, ou toque nele rapidinho para escolher o status.</div>
       <div style={{display:"flex",gap:12,overflowX:"auto",paddingBottom:8,marginLeft:-16,marginRight:-16,paddingLeft:16,paddingRight:16}}>
         {STATUS_LIST.map(status=>{
           const col = cards.filter(c=>getStatus(c.activity.id,c.date)===status.id);
+          const isHover = dragState && dragState.moved && hoverStatus===status.id;
           return (
-            <div key={status.id}
-              onDragOver={e=>e.preventDefault()}
-              onDrop={()=>{ if(dragId){ setStatus(dragId.activityId, dragId.date, status.id); setDragId(null); } }}
-              style={{background:PANEL,borderColor:HAIRLINE,border:"1px solid",borderRadius:16,minWidth:190,flexShrink:0,padding:8}}>
+            <div key={status.id} data-status={status.id}
+              style={{background:isHover?PANEL2:PANEL,borderColor:isHover?GOLD:HAIRLINE,border:"1px solid",borderRadius:16,minWidth:190,flexShrink:0,padding:8,transition:"background 0.1s, border-color 0.1s"}}>
               <div style={{fontSize:11,fontWeight:600,color:MUTED,padding:"4px 4px",display:"flex",justifyContent:"space-between"}}>
                 {status.label} <span>{col.length}</span>
               </div>
@@ -860,9 +1086,14 @@ function Kanban({ activities, categories, getStatus, setStatus }){
                 {col.map(c=>{
                   const color = catColor(categories, c.activity.values.categoria);
                   const isDone = status.id === "finalizado";
+                  const isDragging = dragState && dragState.moved && dragState.activityId===c.activity.id && dragState.date===c.date;
                   return (
-                    <div key={c.activity.id+c.date} draggable onDragStart={()=>setDragId({activityId:c.activity.id,date:c.date})}
-                      style={{background:PANEL2,borderLeft:`3px solid ${color}`,borderRadius:10,padding:8,fontSize:12,cursor:"grab"}}>
+                    <div key={c.activity.id+c.date} data-aid={c.activity.id} data-date={c.date}
+                      onPointerDown={onCardPointerDown}
+                      onPointerMove={onCardPointerMove}
+                      onPointerUp={e=>onCardPointerUp(e,c)}
+                      onPointerCancel={()=>{ setDragState(null); setHoverStatus(null); }}
+                      style={{background:PANEL2,borderLeft:`3px solid ${color}`,borderRadius:10,padding:8,fontSize:12,cursor:"grab",touchAction:"none",opacity:isDragging?0.4:1}}>
                       <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:8}}>
                         <div style={{fontWeight:500}}>{c.activity.values.atividade}</div>
                         <QuickCheck done={isDone} onToggle={()=>setStatus(c.activity.id, c.date, isDone?"aguardando":"finalizado")} />
@@ -877,16 +1108,44 @@ function Kanban({ activities, categories, getStatus, setStatus }){
           );
         })}
       </div>
+
+      {pickerFor && (
+        <div style={{background:"rgba(0,0,0,0.6)",position:"fixed",inset:0,display:"flex",alignItems:"center",justifyContent:"center",zIndex:50,padding:20}} onClick={()=>setPickerFor(null)}>
+          <div style={{background:PANEL,border:`1px solid ${HAIRLINE}`,borderRadius:16,padding:16,maxWidth:300,width:"100%"}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:13,fontWeight:600,marginBottom:2}}>{pickerFor.activity.values.atividade}</div>
+            <div style={{fontSize:11,color:MUTED,marginBottom:10}}>{new Date(pickerFor.date+"T00:00:00").toLocaleDateString("pt-BR",{weekday:"long",day:"2-digit",month:"2-digit"})}</div>
+            <div style={{display:"flex",flexDirection:"column",gap:6,marginBottom:14}}>
+              {STATUS_LIST.map(s=>(
+                <button key={s.id} onClick={()=>{ setStatus(pickerFor.activity.id, pickerFor.date, s.id); setPickerFor(null); }}
+                  style={{background:getStatus(pickerFor.activity.id,pickerFor.date)===s.id?GOLD:PANEL2, color:getStatus(pickerFor.activity.id,pickerFor.date)===s.id?INK:TEXT, border:"none", borderRadius:10, padding:"9px 12px", fontSize:13, textAlign:"left", cursor:"pointer"}}>
+                  {s.label}
+                </button>
+              ))}
+            </div>
+            <div style={{borderTop:`1px solid ${HAIRLINE}`,paddingTop:12}}>
+              <div style={{fontSize:12,color:MUTED,marginBottom:6}}>Remanejar para outro dia</div>
+              <div style={{display:"flex",gap:8}}>
+                <input type="date" value={rescheduleDraft} onChange={e=>setRescheduleDraft(e.target.value)} style={{...inputStyle,flex:1}} />
+                <button
+                  onClick={()=>{ if(rescheduleDraft){ onReschedule(pickerFor.activity.id, pickerFor.date, rescheduleDraft); setPickerFor(null); setRescheduleDraft(""); } }}
+                  style={{...btnGold, padding:"0 14px"}}>Mudar</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
 /* ---------- ATIVIDADES ---------- */
-function Atividades({ activities, setActivities, fields, categories, getStatus, setStatus, todayIso, onAdd, onEdit, onDelete }){
+function Atividades({ activities, setActivities, fields, categories, getStatus, setStatus, todayIso, onAdd, onEdit, onDelete, quickAddTick }){
   const [editing, setEditing] = useState(null);
   const [weekdayFilter, setWeekdayFilter] = useState(null);
   const formFields = fields.filter(f=>f.show.form);
   const filtered = activities.filter(a=>matchesWeekday(a.values, weekdayFilter));
+
+  useEffect(()=>{ if(quickAddTick) setEditing("new"); }, [quickAddTick]);
 
   function save(values){
     if(editing==="new"){
