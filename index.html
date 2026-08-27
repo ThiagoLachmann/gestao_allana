@@ -199,7 +199,12 @@ function normDias(str){
     if(t.startsWith("sab")) return 6; return null;
   }).filter(v=>v!==null);
 }
-function isoDate(d){ return d.toISOString().slice(0,10); }
+function isoDate(d){
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,"0");
+  const day = String(d.getDate()).padStart(2,"0");
+  return `${y}-${m}-${day}`;
+}
 function occursOn(values, date){
   const freq = values.frequencia, dias = normDias(values.diasSemana), wd = date.getDay();
   if(freq==="Diária") return true;
