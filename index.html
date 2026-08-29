@@ -343,17 +343,26 @@ function Root(){
   function handleLogout(){
     setCryptoKey(null); setRawPass(null); setState(null); setPhase("login"); setError("");
   }
-  async function persist(newState){
-    setState(newState);
-    try {
-      if (cryptoKey) {
-        const payload = await encryptObj(cryptoKey, newState);
-        localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
-      } else if (rawPass) {
-        localStorage.setItem(VAULT_KEY, xorObfuscate(JSON.stringify(newState), rawPass));
-      }
-    } catch(e) { /* storage best-effort */ }
+  function persist(updater){
+    setState(prev => typeof updater === "function" ? updater(prev) : { ...prev, ...updater });
   }
+
+  // auto-save whenever state actually changes, decoupled from persist() itself so that
+  // several persist() calls fired in the same tick (e.g. dismissing many overdue items
+  // at once) all correctly build on top of one another instead of overwriting each other.
+  useEffect(() => {
+    if (phase !== "app" || !state) return;
+    (async () => {
+      try {
+        if (cryptoKey) {
+          const payload = await encryptObj(cryptoKey, state);
+          localStorage.setItem(VAULT_KEY, JSON.stringify(payload));
+        } else if (rawPass) {
+          localStorage.setItem(VAULT_KEY, xorObfuscate(JSON.stringify(state), rawPass));
+        }
+      } catch(e) { /* storage best-effort */ }
+    })();
+  }, [state, phase, cryptoKey, rawPass]);
 
   if (phase === "loading") return <Splash text="Carregando…" />;
   if (phase === "setup") return <SetupScreen onSubmit={handleSetup} cryptoOk={CRYPTO_OK} />;
@@ -418,58 +427,132 @@ const btnDanger = { background:"transparent", color:"#F27FA6", border:"1px solid
 /* ============ main app ============ */
 function App({ state, persist, onLogout }){
   const [tab, setTab] = useState("hoje");
+  const [isDesktop, setIsDesktop] = useState(window.innerWidth >= 900);
+  useEffect(()=>{
+    function onResize(){ setIsDesktop(window.innerWidth >= 900); }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  useEffect(()=>{
+    if(isDesktop && (tab==="calendario" || tab==="kanban")) setTab("planejamento");
+    if(!isDesktop && tab==="planejamento") setTab("calendario");
+  }, [isDesktop]);
   const { categories, fields, activities, connections, statusMap, settings } = state;
   const wellbeing = state.wellbeing || {};
   const notes = state.notes || {};
   const reschedules = state.reschedules || {};
 
-  function update(patch){ persist({ ...state, ...patch }); }
-  function setCategories(fn){ update({ categories: fn(categories) }); }
-  function setFields(fn){ update({ fields: fn(fields) }); }
-  function setActivities(fn){ update({ activities: fn(activities) }); }
-  function setConnections(fn){ update({ connections: fn(connections) }); }
-  function setStatusMap(fn){ update({ statusMap: fn(statusMap) }); }
-  function setSettings(fn){ update({ settings: fn(settings) }); }
-  function setWellbeing(fn){ update({ wellbeing: fn(wellbeing) }); }
-  function setNotes(fn){ update({ notes: fn(notes) }); }
-  function setReschedules(fn){ update({ reschedules: fn(reschedules) }); }
+  function update(updater){
+    persist(prev => {
+      const patch = typeof updater === "function" ? updater(prev) : updater;
+      return { ...prev, ...patch };
+    });
+  }
+  function setCategories(fn){ update(prev => ({ categories: fn(prev.categories) })); }
+  function setFields(fn){ update(prev => ({ fields: fn(prev.fields) })); }
+  function setActivities(fn){ update(prev => ({ activities: fn(prev.activities) })); }
+  function setConnections(fn){ update(prev => ({ connections: fn(prev.connections) })); }
+  function setStatusMap(fn){ update(prev => ({ statusMap: fn(prev.statusMap) })); }
+  function setSettings(fn){ update(prev => ({ settings: fn(prev.settings) })); }
+  function setWellbeing(fn){ update(prev => ({ wellbeing: fn(prev.wellbeing||{}) })); }
+  function setNotes(fn){ update(prev => ({ notes: fn(prev.notes||{}) })); }
+  function setReschedules(fn){ update(prev => ({ reschedules: fn(prev.reschedules||{}) })); }
 
   const [syncState, setSyncState] = useState("idle");
-  async function testConnection(){
-    if(!settings.appsScriptUrl) return;
-    setSyncState("testing");
-    try { await sheetGet(settings.appsScriptUrl, "atividades"); setSyncState("ok"); }
-    catch(e){ setSyncState("error"); }
-  }
-  async function importFromSheet(){
+
+  // the Google Sheet is the source of truth once connected: pull it fresh and replace
+  // local activities/status so every device always reflects the same real data instead
+  // of a locally-cached copy that can drift between devices.
+  async function refreshFromSheet(){
     if(!settings.appsScriptUrl) return;
     setSyncState("testing");
     try {
-      const rows = await sheetGet(settings.appsScriptUrl, "atividades");
-      const imported = rows.map(r => ({ id: r.ID, ativo: r.Ativo !== false && r.Ativo !== "FALSE",
+      const [atRows, regRows, bemRows, notaRows, remRows] = await Promise.all([
+        sheetGet(settings.appsScriptUrl, "atividades"),
+        sheetGet(settings.appsScriptUrl, "registros"),
+        sheetGet(settings.appsScriptUrl, "bemestar").catch(()=>[]),
+        sheetGet(settings.appsScriptUrl, "notas").catch(()=>[]),
+        sheetGet(settings.appsScriptUrl, "remanejamentos").catch(()=>[]),
+      ]);
+      const imported = atRows.map(r => ({ id: r.ID, ativo: r.Ativo !== false && r.Ativo !== "FALSE",
         values: { categoria:r.Categoria, atividade:r.Atividade, frequencia:r.Frequencia, diasSemana:r.DiasSemana, horario:r.Horario, duracao:r.Duracao, prioridade:r.Prioridade, lembrete:r.Lembrete, data:r.Data, observacoes:r.Observacoes }}));
-      // make sure every category referenced by the sheet actually exists locally (with a real color),
-      // matching case/accents loosely so a manually-typed "Casa" still finds your "casa" category.
-      setCategories(prevCats => {
-        const known = new Set(prevCats.map(c => normKey(c.id)).concat(prevCats.map(c => normKey(c.name))));
+      const newStatusMap = {};
+      regRows.forEach(r => { if(r.ID_Atividade && r.Data) newStatusMap[`${r.ID_Atividade}_${r.Data}`] = r.Status; });
+      const newWellbeing = {};
+      (Array.isArray(bemRows)?bemRows:[]).forEach(r => { if(r.Data) newWellbeing[r.Data] = { humor:r.Humor, energia:r.Energia, sono:r.Sono }; });
+      const newNotes = {};
+      (Array.isArray(notaRows)?notaRows:[]).forEach(r => { if(r.Data) newNotes[r.Data] = r.Nota; });
+      const newReschedules = {};
+      (Array.isArray(remRows)?remRows:[]).forEach(r => { if(r.Chave) newReschedules[r.Chave] = r.NovaData; });
+      update(prev => {
+        const known = new Set(prev.categories.map(c => normKey(c.id)).concat(prev.categories.map(c => normKey(c.name))));
         const newCats = [];
         imported.forEach(a => {
           const k = normKey(a.values.categoria);
           if (k && !known.has(k) && !newCats.some(c => normKey(c.id) === k)) {
             known.add(k);
-            newCats.push({ id: a.values.categoria, name: a.values.categoria, color: AUTO_PALETTE[(prevCats.length + newCats.length) % AUTO_PALETTE.length] });
+            newCats.push({ id: a.values.categoria, name: a.values.categoria, color: AUTO_PALETTE[(prev.categories.length + newCats.length) % AUTO_PALETTE.length] });
           }
         });
-        return newCats.length ? [...prevCats, ...newCats] : prevCats;
+        return {
+          categories: newCats.length ? [...prev.categories, ...newCats] : prev.categories,
+          activities: imported.length ? imported : prev.activities,
+          statusMap: newStatusMap,
+          wellbeing: newWellbeing,
+          notes: newNotes,
+          reschedules: newReschedules,
+        };
       });
-      if (imported.length) setActivities(() => imported);
       setSyncState("ok");
     } catch(e){ setSyncState("error"); }
   }
-  function syncAdd(values){ if(settings.appsScriptUrl) sheetPost(settings.appsScriptUrl, { action:"novaAtividade", atividade: toSheetPayload(values) }).catch(()=>{}); }
-  function syncEdit(id, values){ if(settings.appsScriptUrl) sheetPost(settings.appsScriptUrl, { action:"editarAtividade", atividade: { id, ...toSheetPayload(values), ativo:true } }).catch(()=>{}); }
-  function syncDelete(id){ if(settings.appsScriptUrl) sheetPost(settings.appsScriptUrl, { action:"excluirAtividade", id }).catch(()=>{}); }
-  function syncStatus(activityId, date, status){ if(settings.appsScriptUrl) sheetPost(settings.appsScriptUrl, { action:"marcar", idAtividade: activityId, data: date, status }).catch(()=>{}); }
+
+
+  // pull the sheet as soon as it's configured / on every app open, and again whenever
+  // the tab/app regains focus (e.g. switching from mobile to desktop and back)
+  useEffect(() => { if(settings.appsScriptUrl) refreshFromSheet(); }, [settings.appsScriptUrl]);
+  useEffect(() => {
+    function onVisible(){ if(document.visibilityState==="visible" && settings.appsScriptUrl) refreshFromSheet(); }
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => { document.removeEventListener("visibilitychange", onVisible); window.removeEventListener("focus", onVisible); };
+  }, [settings.appsScriptUrl]);
+
+  async function syncAdd(values){
+    if(!settings.appsScriptUrl) return;
+    try { await sheetPost(settings.appsScriptUrl, { action:"novaAtividade", atividade: toSheetPayload(values) }); await refreshFromSheet(); }
+    catch(e){ /* stays local-only until the next successful sync */ }
+  }
+  async function syncEdit(id, values){
+    if(!settings.appsScriptUrl) return;
+    try { await sheetPost(settings.appsScriptUrl, { action:"editarAtividade", atividade: { id, ...toSheetPayload(values), ativo:true } }); await refreshFromSheet(); }
+    catch(e){ /* stays local-only until the next successful sync */ }
+  }
+  async function syncDelete(id){
+    if(!settings.appsScriptUrl) return;
+    try { await sheetPost(settings.appsScriptUrl, { action:"excluirAtividade", id }); await refreshFromSheet(); }
+    catch(e){ /* stays local-only until the next successful sync */ }
+  }
+  async function syncStatus(activityId, date, status){
+    if(!settings.appsScriptUrl) return;
+    try { await sheetPost(settings.appsScriptUrl, { action:"marcar", idAtividade: activityId, data: date, status }); }
+    catch(e){ /* stays local-only until the next successful sync */ }
+  }
+  async function syncWellbeing(date, values){
+    if(!settings.appsScriptUrl) return;
+    try { await sheetPost(settings.appsScriptUrl, { action:"salvarBemestar", data: date, humor: values.humor, energia: values.energia, sono: values.sono }); }
+    catch(e){ /* stays local-only until the next successful sync */ }
+  }
+  async function syncNote(date, texto){
+    if(!settings.appsScriptUrl) return;
+    try { await sheetPost(settings.appsScriptUrl, { action:"salvarNota", data: date, nota: texto }); }
+    catch(e){ /* stays local-only until the next successful sync */ }
+  }
+  async function syncReschedule(chave, novaData){
+    if(!settings.appsScriptUrl) return;
+    try { await sheetPost(settings.appsScriptUrl, { action:"salvarRemanejamento", chave, novaData }); }
+    catch(e){ /* stays local-only until the next successful sync */ }
+  }
 
   const activeActivities = useMemo(()=>activities.filter(a=>a.ativo!==false), [activities]);
   const today = new Date(); const todayIso = isoDate(today); const todayWdLabel = WD[today.getDay()];
@@ -486,42 +569,94 @@ function App({ state, persist, onLogout }){
       return next;
     });
     setReschedules(prev => ({ ...prev, [oldKey]: newDate }));
+    syncReschedule(oldKey, newDate);
   }
 
-  const [quickAddTick, setQuickAddTick] = useState(0);
+  const [quickAddOpen, setQuickAddOpen] = useState(false);
+  function saveQuickAdd(values){
+    setActivities(prev => [...prev, { id: `a${Date.now()}`, ativo:true, values }]);
+    syncAdd(values);
+    setQuickAddOpen(false);
+  }
 
   return (
     <div style={{background:INK,color:TEXT,minHeight:"100vh"}} className="fade-in">
-      <div style={{maxWidth:420,margin:"0 auto",display:"flex",flexDirection:"column",minHeight:"100vh",position:"relative"}}>
-        <div style={{borderColor:HAIRLINE,borderBottom:"1px solid"}}>
-          <Header tab={tab} today={today} todayWdLabel={todayWdLabel} settings={settings} syncState={syncState} onLogout={onLogout} />
+      <div style={{maxWidth:isDesktop?1180:420,margin:"0 auto",display:"flex",flexDirection:isDesktop?"row":"column",minHeight:"100vh",position:"relative"}}>
+        {isDesktop && (
+          <nav style={{borderColor:HAIRLINE,borderRight:"1px solid",background:PANEL,width:210,flexShrink:0,display:"flex",flexDirection:"column",padding:"20px 10px",gap:4}}>
+            <div style={{fontFamily:"Georgia,serif",fontSize:18,padding:"0 10px 20px"}}>Minha Rotina</div>
+            <SideNavBtn icon="home" label="Hoje" active={tab==="hoje"} onClick={()=>setTab("hoje")} />
+            <SideNavBtn icon="grid" label="Planejamento" active={tab==="planejamento"} onClick={()=>setTab("planejamento")} />
+            <SideNavBtn icon="chart" label="Gráficos" active={tab==="graficos"} onClick={()=>setTab("graficos")} />
+            <SideNavBtn icon="list" label="Atividades" active={tab==="atividades"} onClick={()=>setTab("atividades")} />
+            <SideNavBtn icon="gear" label="Ajustes" active={tab==="ajustes"} onClick={()=>setTab("ajustes")} />
+            <button
+              onClick={()=>setQuickAddOpen(true)}
+              style={{ marginTop:16, background:GOLD, color:INK, border:"none", borderRadius:10, padding:"10px 12px", fontSize:13, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
+              <Icon name="plus" size={15} color={INK} /> Nova atividade
+            </button>
+          </nav>
+        )}
+        <div style={{flex:1,display:"flex",flexDirection:"column",minHeight:"100vh",position:"relative"}}>
+          <div style={{borderColor:HAIRLINE,borderBottom:"1px solid"}}>
+            <Header tab={tab} today={today} todayWdLabel={todayWdLabel} settings={settings} syncState={syncState} onLogout={onLogout} />
+          </div>
+          <div style={{flex:1,overflowY:"auto",padding:isDesktop?"24px 32px":"16px"}}>
+            {tab==="hoje" && <Hoje todayActivities={todayActivities} allActivities={activeActivities} fields={fields} categories={categories} todayIso={todayIso} getStatus={getStatus} setStatus={setStatus} wellbeing={wellbeing} setWellbeing={setWellbeing} notes={notes} setNotes={setNotes} reschedules={reschedules} syncWellbeing={syncWellbeing} syncNote={syncNote} />}
+            {tab==="calendario" && <CalendarTab activities={activeActivities} categories={categories} fields={fields} getStatus={getStatus} setStatus={setStatus} reschedules={reschedules} />}
+            {tab==="graficos" && <GraficosTab activities={activeActivities} categories={categories} getStatus={getStatus} reschedules={reschedules} />}
+            {tab==="kanban" && <Kanban activities={activeActivities} categories={categories} getStatus={getStatus} setStatus={setStatus} reschedules={reschedules} onReschedule={rescheduleOccurrence} />}
+            {tab==="planejamento" && (
+              <div style={{display:"flex",gap:24,alignItems:"flex-start"}}>
+                <div style={{width:360,flexShrink:0}}>
+                  <CalendarTab activities={activeActivities} categories={categories} fields={fields} getStatus={getStatus} setStatus={setStatus} reschedules={reschedules} />
+                </div>
+                <div style={{flex:1,minWidth:0}}>
+                  <Kanban activities={activeActivities} categories={categories} getStatus={getStatus} setStatus={setStatus} reschedules={reschedules} onReschedule={rescheduleOccurrence} />
+                </div>
+              </div>
+            )}
+            {tab==="atividades" && <Atividades activities={activities} setActivities={setActivities} fields={fields} categories={categories} getStatus={getStatus} setStatus={setStatus} todayIso={todayIso} onAdd={syncAdd} onEdit={syncEdit} onDelete={syncDelete} />}
+            {tab==="ajustes" && <Ajustes fields={fields} setFields={setFields} categories={categories} setCategories={setCategories} settings={settings} setSettings={setSettings} syncState={syncState} refreshFromSheet={refreshFromSheet} />}
+          </div>
+          {!isDesktop && (
+            <button
+              onClick={()=>setQuickAddOpen(true)}
+              aria-label="Nova atividade"
+              style={{ position:"absolute", left:"50%", transform:"translateX(-50%)", bottom:44, width:52, height:52, borderRadius:99, background:GOLD, border:`4px solid ${INK}`, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", boxShadow:"0 2px 10px rgba(0,0,0,0.4)" }}>
+              <Icon name="plus" size={22} color={INK} />
+            </button>
+          )}
+          {quickAddOpen && (
+            <EditModal
+              initial={Object.fromEntries(fields.filter(f=>f.show.form).map(f=>[f.id,""]))}
+              fields={fields.filter(f=>f.show.form)}
+              categories={categories}
+              onCancel={()=>setQuickAddOpen(false)}
+              onSave={saveQuickAdd}
+            />
+          )}
+          {!isDesktop && (
+            <nav style={{borderColor:HAIRLINE,borderTop:"1px solid",background:PANEL,display:"flex",justifyContent:"space-around",padding:"6px 0"}}>
+              <TabBtn icon="home" label="Hoje" active={tab==="hoje"} onClick={()=>setTab("hoje")} />
+              <TabBtn icon="calendar" label="Calendário" active={tab==="calendario"} onClick={()=>setTab("calendario")} />
+              <TabBtn icon="chart" label="Gráficos" active={tab==="graficos"} onClick={()=>setTab("graficos")} />
+              <span style={{width:40}} />
+              <TabBtn icon="grid" label="Kanban" active={tab==="kanban"} onClick={()=>setTab("kanban")} />
+              <TabBtn icon="list" label="Atividades" active={tab==="atividades"} onClick={()=>setTab("atividades")} />
+              <TabBtn icon="gear" label="Ajustes" active={tab==="ajustes"} onClick={()=>setTab("ajustes")} />
+            </nav>
+          )}
         </div>
-        <div style={{flex:1,overflowY:"auto",padding:"16px"}}>
-          {tab==="hoje" && <Hoje todayActivities={todayActivities} allActivities={activeActivities} fields={fields} categories={categories} todayIso={todayIso} getStatus={getStatus} setStatus={setStatus} wellbeing={wellbeing} setWellbeing={setWellbeing} notes={notes} setNotes={setNotes} reschedules={reschedules} />}
-          {tab==="calendario" && <CalendarTab activities={activeActivities} categories={categories} fields={fields} getStatus={getStatus} setStatus={setStatus} reschedules={reschedules} />}
-          {tab==="graficos" && <GraficosTab activities={activeActivities} categories={categories} getStatus={getStatus} reschedules={reschedules} />}
-          {tab==="kanban" && <Kanban activities={activeActivities} categories={categories} getStatus={getStatus} setStatus={setStatus} reschedules={reschedules} onReschedule={rescheduleOccurrence} />}
-          {tab==="atividades" && <Atividades activities={activities} setActivities={setActivities} fields={fields} categories={categories} getStatus={getStatus} setStatus={setStatus} todayIso={todayIso} onAdd={syncAdd} onEdit={syncEdit} onDelete={syncDelete} quickAddTick={quickAddTick} />}
-          {tab==="ajustes" && <Ajustes fields={fields} setFields={setFields} categories={categories} setCategories={setCategories} settings={settings} setSettings={setSettings} syncState={syncState} testConnection={testConnection} importFromSheet={importFromSheet} />}
-        </div>
-        <button
-          onClick={()=>{ setTab("atividades"); setQuickAddTick(t=>t+1); }}
-          aria-label="Nova atividade"
-          style={{ position:"absolute", left:"50%", transform:"translateX(-50%)", bottom:44, width:52, height:52, borderRadius:99, background:GOLD, border:`4px solid ${INK}`, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", boxShadow:"0 2px 10px rgba(0,0,0,0.4)" }}>
-          <Icon name="plus" size={22} color={INK} />
-        </button>
-        <nav style={{borderColor:HAIRLINE,borderTop:"1px solid",background:PANEL,display:"flex",justifyContent:"space-around",padding:"6px 0"}}>
-          <TabBtn icon="home" label="Hoje" active={tab==="hoje"} onClick={()=>setTab("hoje")} />
-          <TabBtn icon="calendar" label="Calendário" active={tab==="calendario"} onClick={()=>setTab("calendario")} />
-          <TabBtn icon="chart" label="Gráficos" active={tab==="graficos"} onClick={()=>setTab("graficos")} />
-          <span style={{width:40}} />
-          <TabBtn icon="grid" label="Kanban" active={tab==="kanban"} onClick={()=>setTab("kanban")} />
-          <TabBtn icon="list" label="Atividades" active={tab==="atividades"} onClick={()=>setTab("atividades")} />
-          <TabBtn icon="gear" label="Ajustes" active={tab==="ajustes"} onClick={()=>setTab("ajustes")} />
-        </nav>
-
       </div>
     </div>
+  );
+}
+function SideNavBtn({ icon, label, active, onClick }){
+  return (
+    <button onClick={onClick} style={{background:active?PANEL2:"transparent",border:"none",cursor:"pointer",color:active?GOLD:MUTED,display:"flex",alignItems:"center",gap:10,padding:"10px 12px",borderRadius:10,fontSize:13,textAlign:"left"}}>
+      <Icon name={icon} size={17} color={active?GOLD:MUTED} /> {label}
+    </button>
   );
 }
 
@@ -611,9 +746,10 @@ function WellbeingRow({ label, options, value, onChange }){
   );
 }
 
-function Hoje({ todayActivities, allActivities, fields, categories, todayIso, getStatus, setStatus, wellbeing, setWellbeing, notes, setNotes, reschedules }){
-  const done = todayActivities.filter(a=>getStatus(a.id, todayIso)==="finalizado").length;
-  const total = todayActivities.length;
+function Hoje({ todayActivities, allActivities, fields, categories, todayIso, getStatus, setStatus, wellbeing, setWellbeing, notes, setNotes, reschedules, syncWellbeing, syncNote }){
+  const visibleToday = todayActivities.filter(a=>getStatus(a.id, todayIso)!=="cancelado");
+  const done = visibleToday.filter(a=>getStatus(a.id, todayIso)==="finalizado").length;
+  const total = visibleToday.length;
   const visibleFields = fields.filter(f=>f.show.today && f.id!=="categoria" && f.id!=="atividade");
 
   const [overdueOpen, setOverdueOpen] = useState(false);
@@ -624,12 +760,18 @@ function Hoje({ todayActivities, allActivities, fields, categories, todayIso, ge
   }
 
   const todayWellbeing = wellbeing[todayIso] || {};
-  function setMood(kind, i){ setWellbeing(prev => ({ ...prev, [todayIso]: { ...(prev[todayIso]||{}), [kind]: i } })); }
+  function setMood(kind, i){
+    setWellbeing(prev => {
+      const merged = { ...(prev[todayIso]||{}), [kind]: i };
+      syncWellbeing(todayIso, merged);
+      return { ...prev, [todayIso]: merged };
+    });
+  }
 
   const [noteOpen, setNoteOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState(notes[todayIso] || "");
   useEffect(()=>{ setNoteDraft(notes[todayIso] || ""); }, [todayIso]);
-  function commitNote(){ setNotes(prev => ({ ...prev, [todayIso]: noteDraft })); }
+  function commitNote(){ setNotes(prev => ({ ...prev, [todayIso]: noteDraft })); syncNote(todayIso, noteDraft); }
 
   const weekDays = useMemo(()=>getWeekDays(new Date()), [todayIso]);
   const weekStats = useMemo(()=>{
@@ -686,7 +828,7 @@ function Hoje({ todayActivities, allActivities, fields, categories, todayIso, ge
           <EmptyState text="Nenhuma atividade prevista para hoje. Aproveite para respirar ou adiantar algo da semana." />
         ) : (
           <div style={{display:"flex",flexDirection:"column",gap:8}}>
-            {todayActivities.map(a=>{
+            {visibleToday.map(a=>{
               const isDone = getStatus(a.id, todayIso)==="finalizado";
               const color = catColor(categories, a.values.categoria);
               return (
@@ -757,7 +899,7 @@ function CalendarTab({ activities, categories, fields, getStatus, setStatus, res
 
   const todayIso = isoDate(new Date());
   const selectedDateObj = new Date(selected+"T00:00:00");
-  const dayActivities = getOccurrencesForDate(activities, selectedDateObj, reschedules);
+  const dayActivities = getOccurrencesForDate(activities, selectedDateObj, reschedules).filter(a=>getStatus(a.id, selected)!=="cancelado");
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:12}}>
@@ -774,7 +916,7 @@ function CalendarTab({ activities, categories, fields, getStatus, setStatus, res
           {cells.map((d,i)=>{
             if(!d) return <div key={i} />;
             const iso = isoDate(d);
-            const pending = getOccurrencesForDate(activities, d, reschedules).filter(a=>getStatus(a.id, iso)!=="finalizado").length;
+            const pending = getOccurrencesForDate(activities, d, reschedules).filter(a=>{ const st=getStatus(a.id, iso); return st!=="finalizado" && st!=="cancelado"; }).length;
             const isSelected = iso===selected;
             const isToday = iso===todayIso;
             return (
@@ -1139,13 +1281,11 @@ function Kanban({ activities, categories, getStatus, setStatus, reschedules, onR
 }
 
 /* ---------- ATIVIDADES ---------- */
-function Atividades({ activities, setActivities, fields, categories, getStatus, setStatus, todayIso, onAdd, onEdit, onDelete, quickAddTick }){
+function Atividades({ activities, setActivities, fields, categories, getStatus, setStatus, todayIso, onAdd, onEdit, onDelete }){
   const [editing, setEditing] = useState(null);
   const [weekdayFilter, setWeekdayFilter] = useState(null);
   const formFields = fields.filter(f=>f.show.form);
   const filtered = activities.filter(a=>matchesWeekday(a.values, weekdayFilter));
-
-  useEffect(()=>{ if(quickAddTick) setEditing("new"); }, [quickAddTick]);
 
   function save(values){
     if(editing==="new"){
@@ -1226,7 +1366,7 @@ function EditModal({ initial, fields, categories, onCancel, onSave }){
 }
 
 /* ---------- AJUSTES ---------- */
-function Ajustes({ fields, setFields, categories, setCategories, settings, setSettings, syncState, testConnection, importFromSheet }){
+function Ajustes({ fields, setFields, categories, setCategories, settings, setSettings, syncState, refreshFromSheet }){
   const [openFields, setOpenFields] = useState(true);
   const [openCats, setOpenCats] = useState(false);
   function updateField(id, patch){ setFields(prev=>prev.map(f=>f.id===id?{...f,...patch}:f)); }
@@ -1243,10 +1383,9 @@ function Ajustes({ fields, setFields, categories, setCategories, settings, setSe
         <div style={{fontSize:12,color:MUTED,display:"flex",alignItems:"center",gap:6,marginBottom:8}}><Icon name="link" size={13}/> Conexão com Google Sheets</div>
         <input value={settings.appsScriptUrl} onChange={e=>setSettings(s=>({...s,appsScriptUrl:e.target.value}))} placeholder="Cole aqui a URL do Apps Script (…/exec)" style={{...inputStyle,marginBottom:8,fontSize:12}} />
         <div style={{display:"flex",gap:8}}>
-          <button onClick={testConnection} style={{...btnGold,flex:1,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}><Icon name="refresh" size={12} color={INK}/> Testar</button>
-          <button onClick={importFromSheet} style={{background:PANEL2,color:TEXT,border:`1px solid ${HAIRLINE}`,borderRadius:10,flex:1,fontSize:12,cursor:"pointer"}}>Importar da planilha</button>
+          <button onClick={refreshFromSheet} style={{...btnGold,flex:1,fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",gap:6}}><Icon name="refresh" size={12} color={INK}/> Sincronizar agora</button>
         </div>
-        {syncState==="ok" && <div style={{fontSize:11,color:"#6FD9A0",marginTop:6}}>Conectado com sucesso.</div>}
+        {syncState==="ok" && <div style={{fontSize:11,color:"#6FD9A0",marginTop:6}}>Sincronizado com a planilha.</div>}
         {syncState==="error" && <div style={{fontSize:11,color:"#F27FA6",marginTop:6}}>Não consegui conectar. Confira a implantação (acesso "Qualquer pessoa") e tente de novo.</div>}
       </div>
 
